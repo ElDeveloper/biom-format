@@ -9,16 +9,12 @@
 # ----------------------------------------------------------------------------
 
 from __future__ import division
-import os
 from string import maketrans
-import numpy as np
 from biom import __version__
 from biom.exception import BiomParseException
-from biom.table import table_factory, nparray_to_sparse, Table
-from functools import partial
+from biom.table import nparray_to_sparse, Table
 import json
 from numpy import asarray
-from scipy.sparse import csr_matrix, csc_matrix
 
 __author__ = "Justin Kuczynski"
 __copyright__ = "Copyright 2011-2013, The BIOM Format Development Team"
@@ -253,36 +249,12 @@ def parse_biom_table(fp, input_is_dense=False):
         pass
 
     if hasattr(fp, 'read'):
-        return parse_biom_table_json(json.load(fp),
-                                     input_is_dense=input_is_dense)
+        return Table.from_json(json.load(fp), input_is_dense=input_is_dense)
     elif isinstance(fp, list):
-        return parse_biom_table_json(json.loads(''.join(fp)),
-                                     input_is_dense=input_is_dense)
+        return Table.from_json(json.loads(''.join(fp)),
+                               input_is_dense=input_is_dense)
     else:
-        return parse_biom_table_json(json.loads(fp),
-                                     input_is_dense=input_is_dense)
-
-
-def parse_biom_table_json(json_table, data_pump=None, input_is_dense=False):
-    """Parse a biom otu table type"""
-    sample_ids = [col['id'] for col in json_table['columns']]
-    sample_metadata = [col['metadata'] for col in json_table['columns']]
-    obs_ids = [row['id'] for row in json_table['rows']]
-    obs_metadata = [row['metadata'] for row in json_table['rows']]
-    dtype = MATRIX_ELEMENT_TYPE[json_table['matrix_element_type']]
-
-    if data_pump is None:
-        table_obj = table_factory(json_table['data'], obs_ids, sample_ids,
-                                  obs_metadata, sample_metadata,
-                                  shape=json_table['shape'],
-                                  dtype=dtype, input_is_dense=input_is_dense)
-    else:
-        table_obj = table_factory(data_pump, obs_ids, sample_ids,
-                                  obs_metadata, sample_metadata,
-                                  shape=json_table['shape'],
-                                  dtype=dtype, input_is_dense=input_is_dense)
-
-    return table_obj
+        return Table.from_json(json.loads(fp), input_is_dense=input_is_dense)
 
 
 def sc_pipe_separated(x):
@@ -293,135 +265,6 @@ def sc_pipe_separated(x):
             simple_metadata.append(e.strip())
         complex_metadata.append(simple_metadata)
     return complex_metadata
-
-
-def parse_classic_table_to_rich_table(lines, sample_mapping, obs_mapping,
-                                      process_func, **kwargs):
-    """Parses an table (tab delimited) (observation x sample)
-
-    sample_mapping : can be None or {'sample_id':something}
-    obs_mapping : can be none or {'observation_id':something}
-    """
-    sample_ids, obs_ids, data, t_md, t_md_name = parse_classic_table(lines,
-                                                                     **kwargs)
-
-    # if we have it, keep it
-    if t_md is None:
-        obs_metadata = None
-    else:
-        obs_metadata = [{t_md_name: process_func(v)} for v in t_md]
-
-    if sample_mapping is None:
-        sample_metadata = None
-    else:
-        sample_metadata = [sample_mapping[sample_id]
-                           for sample_id in sample_ids]
-
-    # will override any metadata from parsed table
-    if obs_mapping is not None:
-        obs_metadata = [obs_mapping[obs_id] for obs_id in obs_ids]
-
-    data = nparray_to_sparse(data)
-
-    return table_factory(data, obs_ids, sample_ids, obs_metadata,
-                         sample_metadata)
-
-
-def parse_classic_table(lines, delim='\t', dtype=float, header_mark=None,
-                        md_parse=None):
-    """Parse a classic table into (sample_ids, obs_ids, data, metadata, name)
-
-    If the last column does not appear to be numeric, interpret it as
-    observation metadata, otherwise None.
-
-    md_name is the column name for the last column if non-numeric
-
-    NOTE: this is intended to be close to how QIIME classic OTU tables are
-    parsed with the exception of the additional md_name field
-
-    This function is ported from QIIME (http://www.qiime.org), previously named
-    parse_classic_otu_table. QIIME is a GPL project, but we obtained permission
-    from the authors of this function to port it to the BIOM Format project
-    (and keep it under BIOM's BSD license).
-    """
-    if not isinstance(lines, list):
-        try:
-            lines = lines.readlines()
-        except AttributeError:
-            raise BiomParseException(
-                "Input needs to support readlines or be indexable")
-
-    # find header, the first line that is not empty and does not start with a #
-    for idx, l in enumerate(lines):
-        if not l.strip():
-            continue
-        if not l.startswith('#'):
-            break
-        if header_mark and l.startswith(header_mark):
-            break
-
-    if idx == 0:
-        data_start = 1
-        header = lines[0].strip().split(delim)[1:]
-    else:
-        if header_mark is not None:
-            data_start = idx + 1
-            header = lines[idx].strip().split(delim)[1:]
-        else:
-            data_start = idx
-            header = lines[idx - 1].strip().split(delim)[1:]
-
-    # attempt to determine if the last column is non-numeric, ie, metadata
-    first_values = lines[data_start].strip().split(delim)
-    last_value = first_values[-1]
-    last_column_is_numeric = True
-
-    if '.' in last_value:
-        try:
-            float(last_value)
-        except ValueError:
-            last_column_is_numeric = False
-    else:
-        try:
-            int(last_value)
-        except ValueError:
-            last_column_is_numeric = False
-
-    # determine sample ids
-    if last_column_is_numeric:
-        md_name = None
-        metadata = None
-        samp_ids = header[:]
-    else:
-        md_name = header[-1]
-        metadata = []
-        samp_ids = header[:-1]
-
-    data = []
-    obs_ids = []
-    for line in lines[data_start:]:
-        line = line.strip()
-        if not line:
-            continue
-        if line.startswith('#'):
-            continue
-
-        fields = line.strip().split(delim)
-        obs_ids.append(fields[0])
-
-        if last_column_is_numeric:
-            values = map(dtype, fields[1:])
-        else:
-            values = map(dtype, fields[1:-1])
-
-            if md_parse is not None:
-                metadata.append(md_parse(fields[-1]))
-            else:
-                metadata.append(fields[-1])
-
-        data.append(values)
-
-    return samp_ids, obs_ids, asarray(data), metadata, md_name
 
 
 class MetadataMap(dict):
@@ -552,10 +395,9 @@ def convert_table_to_biom(table_f, sample_mapping, obs_mapping,
     process_func: a function to transform observation metadata
     dtype : type of table data
     """
-    otu_table = parse_classic_table_to_rich_table(table_f, sample_mapping,
-                                                  obs_mapping, process_func,
-                                                  **kwargs)
-    return otu_table.get_biom_format_json_string(generatedby())
+    otu_table = Table.from_tsv(table_f, obs_mapping, sample_mapping,
+                               process_func, **kwargs)
+    return otu_table.to_json(generatedby())
 
 
 def biom_meta_to_string(metadata, replace_str=':'):

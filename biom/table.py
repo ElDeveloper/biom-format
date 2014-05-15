@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# -*- coding: utf-8 -*-
 """The BIOM Table API"""
 
 # -----------------------------------------------------------------------------
@@ -10,12 +11,11 @@
 # -----------------------------------------------------------------------------
 
 from __future__ import division
-import os
 import numpy as np
 from copy import deepcopy
 from datetime import datetime
 from json import dumps, loads
-from functools import reduce, partial
+from functools import reduce
 from operator import itemgetter, add
 from itertools import izip
 from collections import defaultdict, Hashable
@@ -27,7 +27,7 @@ from biom.util import (get_biom_format_version_string,
                        get_biom_format_url_string, flatten, natsort,
                        prefer_self, index_list, H5PY_VLEN_STR, HAVE_H5PY)
 
-from ._filter import filter_sparse_array
+from ._filter import _filter
 from ._transform import _transform
 
 
@@ -35,11 +35,16 @@ __author__ = "Daniel McDonald"
 __copyright__ = "Copyright 2011-2013, The BIOM Format Development Team"
 __credits__ = ["Daniel McDonald", "Jai Ram Rideout", "Greg Caporaso",
                "Jose Clemente", "Justin Kuczynski", "Adam Robbins-Pianka",
-               "Joshua Shorenstein", "Jose Antonio Navas Molina"]
+               "Joshua Shorenstein", "Jose Antonio Navas Molina",
+               "Jorge Cañardo Alastuey"]
 __license__ = "BSD"
 __url__ = "http://biom-format.org"
 __maintainer__ = "Daniel McDonald"
 __email__ = "daniel.mcdonald@colorado.edu"
+
+
+MATRIX_ELEMENT_TYPE = {'int': int, 'float': float, 'unicode': unicode,
+                       u'int': int, u'float': float, u'unicode': unicode}
 
 
 class Table(object):
@@ -52,11 +57,21 @@ class Table(object):
 
     def __init__(self, data, observation_ids, sample_ids,
                  observation_metadata=None, sample_metadata=None,
-                 table_id=None, type=None, **kwargs):
+                 table_id=None, type=None, create_date=None, generated_by=None,
+                 **kwargs):
 
         self.type = type
         self.table_id = table_id
-        self._data = data
+        self.create_date = create_date
+        self.generated_by = generated_by
+
+        if not isspmatrix(data):
+            shape = (len(observation_ids), len(sample_ids))
+            input_is_dense = kwargs.get('input_is_dense', False)
+            self._data = Table._to_sparse(data, input_is_dense=input_is_dense,
+                                          shape=shape)
+        else:
+            self._data = data
 
         # using object to allow for variable length strings
         self.sample_ids = np.asarray(sample_ids, dtype=object)
@@ -96,9 +111,10 @@ class Table(object):
         if isspmatrix(vals):
             return vals
         else:
-            return to_sparse(vals, transpose, dtype)
+            return Table._to_sparse(vals, transpose, dtype)
 
-    def _to_dense(self, vec):
+    @staticmethod
+    def _to_dense(vec):
         """Converts a row/col vector to a dense numpy array.
 
         Always returns a 1-D row vector for consistency with numpy iteration
@@ -113,6 +129,69 @@ class Table(object):
             return dense_vec.reshape(1)
         else:
             return np.squeeze(dense_vec)
+
+    @staticmethod
+    def _to_sparse(values, transpose=False, dtype=float, input_is_dense=False,
+                   shape=None):
+        """Try to return a populated scipy.sparse matrix.
+
+        NOTE: assumes the max value observed in row and col defines the size of
+        the matrix.
+        """
+        # if it is a vector
+        if isinstance(values, ndarray) and len(values.shape) == 1:
+            if transpose:
+                mat = nparray_to_sparse(values[:, newaxis], dtype)
+            else:
+                mat = nparray_to_sparse(values, dtype)
+            return mat
+        if isinstance(values, ndarray):
+            if transpose:
+                mat = nparray_to_sparse(values.T, dtype)
+            else:
+                mat = nparray_to_sparse(values, dtype)
+            return mat
+        # the empty list
+        elif isinstance(values, list) and len(values) == 0:
+            return coo_matrix((0, 0))
+        # list of np vectors
+        elif isinstance(values, list) and isinstance(values[0], ndarray):
+            mat = list_nparray_to_sparse(values, dtype)
+            if transpose:
+                mat = mat.T
+            return mat
+        # list of dicts, each representing a row in row order
+        elif isinstance(values, list) and isinstance(values[0], dict):
+            mat = list_dict_to_sparse(values, dtype)
+            if transpose:
+                mat = mat.T
+            return mat
+        # list of scipy.sparse matrices, each representing a row in row order
+        elif isinstance(values, list) and isspmatrix(values[0]):
+            mat = list_sparse_to_sparse(values, dtype)
+            if transpose:
+                mat = mat.T
+            return mat
+        elif isinstance(values, dict):
+            mat = dict_to_sparse(values, dtype, shape)
+            if transpose:
+                mat = mat.T
+            return mat
+        elif isinstance(values, list) and isinstance(values[0], list):
+            if input_is_dense:
+                d = coo_matrix(values)
+                mat = coo_arrays_to_sparse((d.data, (d.row, d.col)),
+                                           dtype=dtype, shape=shape)
+            else:
+                mat = list_list_to_sparse(values, dtype, shape=shape)
+            return mat
+        elif isspmatrix(values):
+            mat = values
+            if transpose:
+                mat = mat.transpose()
+            return mat
+        else:
+            raise TableException("Unknown input type")
 
     def _verify_metadata(self):
         """Obtain some notion of sanity on object construction with inputs"""
@@ -213,7 +292,7 @@ class Table(object):
         ----------
         md : dict of dict
             ``md`` should be of the form ``{id:{dict_of_metadata}}``
-        axis : 'sample' or 'observation'
+        axis : {'sample', 'observation'}, optional
             The axis to operate on
         """
         if axis == 'sample':
@@ -241,7 +320,43 @@ class Table(object):
         self._cast_metadata()
 
     def __getitem__(self, args):
-        """Handles row or column slices."""
+        """Handles row or column slices
+
+        Slicing over an individual axis is supported, but slicing over both
+        axes at the same time is not supported. Partial slices, such as
+        `foo[0, 5:10]` are not supported, however full slices are supported,
+        such as `foo[0, :]`.
+
+        Parameters
+        ----------
+        args : tuple or slice
+            The specific element (by index position) to return or an entire
+            row or column of the data.
+
+        Returns
+        -------
+        float or spmatrix
+            A float is return if a specific element is specified, otherwise a
+            spmatrix object representing a vector of sparse data is returned.
+
+        Raises
+        ------
+        IndexError
+            - If the matrix is empty
+            - If the arguments do not appear to be a tuple
+            - If a slice on row and column is specified
+            - If a partial slice is specified
+
+        Notes
+        -----
+        Switching between slicing rows and columns is inefficient.  Slicing of
+        rows requires a CSR representation, while slicing of columns requires a
+        CSC representation, and transforms are performed on the data if the
+        data are not in the required representation. These transforms can be
+        expensive if done frequently.
+
+        .. shownumpydoc
+        """
         if self.is_empty():
             raise IndexError("Cannot retrieve an element from an empty/null "
                              "table.")
@@ -274,6 +389,15 @@ class Table(object):
         """Return the row at ``row_idx``.
 
         A row vector will be returned as a scipy.sparse matrix in csr format.
+
+        Notes
+        -----
+        Switching between slicing rows and columns is inefficient.  Slicing of
+        rows requires a CSR representation, while slicing of columns requires a
+        CSC representation, and transforms are performed on the data if the
+        data are not in the required representation. These transforms can be
+        expensive if done frequently.
+
         """
         self._data = self._data.tocsr()
         return self._data.getrow(row_idx)
@@ -283,6 +407,15 @@ class Table(object):
 
         A column vector will be returned as a scipy.sparse matrix in csc
         format.
+
+        Notes
+        -----
+        Switching between slicing rows and columns is inefficient.  Slicing of
+        rows requires a CSR representation, while slicing of columns requires a
+        CSC representation, and transforms are performed on the data if the
+        data are not in the required representation. These transforms can be
+        expensive if done frequently.
+
         """
         self._data = self._data.tocsc()
         return self._data.getcol(col_idx)
@@ -352,6 +485,64 @@ class Table(object):
                               self.sample_ids[:], self.observation_ids[:],
                               sample_md_copy, obs_md_copy, self.table_id)
 
+    def metadata(self, id_, axis):
+        """Return the metadata of the identified sample/observation.
+
+        Parameters
+        ----------
+        id_ : str
+            ID of the sample or observation whose index will be returned.
+        axis : {'sample', 'observation'}
+            Axis to search for `id_`.
+
+        Returns
+        -------
+        defaultdict or None
+            The corresponding metadata `defaultdict` or None of that axis does
+            not have metadata.
+
+        Raises
+        ------
+        UnknownAxisError
+            If provided an unrecognized axis.
+        UnknownIDError
+            If provided an unrecognized sample/observation ID.
+
+        Examples
+        --------
+        >>> import numpy as np
+        >>> from biom.table import Table
+
+        Create a 2x3 BIOM table, with observation metadata and no sample
+        metadata:
+
+        >>> data = np.asarray([[0, 0, 1], [1, 3, 42]])
+        >>> table = Table(data, ['O1', 'O2'], ['S1', 'S2', 'S3'],
+        ...               [{'foo': 'bar'}, {'x': 'y'}], None)
+
+        Get the metadata of the observation with ID "O2":
+
+        >>> # casting to `dict` as the return is `defaultdict`
+        >>> dict(table.metadata('O2', 'observation'))
+        {'x': 'y'}
+
+        Get the metadata of the sample with ID "S1":
+
+        >>> table.metadata('S1', 'sample') is None
+        True
+
+        """
+        if axis == 'sample':
+            md = self.sample_metadata
+        elif axis == 'observation':
+            md = self.observation_metadata
+        else:
+            raise UnknownAxisError(axis)
+
+        idx = self.index(id_, axis=axis)
+
+        return md[idx] if md is not None else None
+
     def index(self, id_, axis):
         """Return the index of the identified sample/observation.
 
@@ -378,12 +569,12 @@ class Table(object):
         --------
 
         >>> import numpy as np
-        >>> from biom.table import table_factory
+        >>> from biom.table import Table
 
         Create a 2x3 BIOM table:
 
         >>> data = np.asarray([[0, 0, 1], [1, 3, 42]])
-        >>> table = table_factory(data, ['O1', 'O2'], ['S1', 'S2', 'S3'])
+        >>> table = Table(data, ['O1', 'O2'], ['S1', 'S2', 'S3'])
 
         Get the index of the observation with ID "O2":
 
@@ -420,6 +611,21 @@ class Table(object):
         """
         return self.delimited_self()
 
+    def __repr__(self):
+        """Returns a high-level summary of the table's properties
+
+        Returns
+        -------
+        str
+            A string detailing the shape, class, number of nonzero entries, and
+            table density
+        """
+        rows, cols = self.shape
+        return '%d x %d %s with %d nonzero entries (%d%% dense)' % (
+            rows, cols, repr(self.__class__), self.nnz,
+            self.get_table_density() * 100
+        )
+
     def exists(self, id_, axis="sample"):
         """Returns whether id_ exists in axis
 
@@ -427,13 +633,39 @@ class Table(object):
         ----------
         id_: str
             id to check if exists
-        axis : 'sample' or 'observation'
+        axis : {'sample', 'observation'}, optional
             The axis to check
 
         Returns
         -------
         bool
             True if ``id_`` exists, False otherwise
+
+        Examples
+        --------
+
+        >>> import numpy as np
+        >>> from biom.table import Table
+
+        Create a 2x3 BIOM table:
+
+        >>> data = np.asarray([[0, 0, 1], [1, 3, 42]])
+        >>> table = Table(data, ['O1', 'O2'], ['S1', 'S2', 'S3'])
+
+        Check whether sample ID is in the table:
+
+        >>> table.exists('S1')
+        True
+        >>> table.exists('S4')
+        False
+
+        Check whether an observation ID is in the table:
+
+        >>> table.exists('O1', 'observation')
+        True
+        >>> table.exists('O3', 'observation')
+        False
+
         """
         if axis == "sample":
             return id_ in self._sample_index
@@ -557,7 +789,9 @@ class Table(object):
 
     def __eq__(self, other):
         """Equality is determined by the data matrix, metadata, and IDs"""
-        if isinstance(other, self.__class__) is False:
+        if not isinstance(other, self.__class__):
+            return False
+        if self.type != other.type:
             return False
         if np.any(self.observation_ids != other.observation_ids):
             return False
@@ -566,8 +800,6 @@ class Table(object):
         if self.observation_metadata != other.observation_metadata:
             return False
         if self.sample_metadata != other.sample_metadata:
-            return False
-        if self.type != other.type:
             return False
         if not self._data_equality(other._data):
             return False
@@ -600,9 +832,7 @@ class Table(object):
         self._data = self._data.tocsr()
         other = other.tocsr()
 
-        # From:
-        # http://mail.scipy.org/pipermail/scipy-user/2008-April/016276.html
-        if abs(self._data - other).nnz > 0:
+        if (self._data != other).nnz > 0:
             return False
 
         return True
@@ -635,10 +865,12 @@ class Table(object):
 
     def copy(self):
         """Returns a copy of the table"""
-        # NEEDS TO BE A DEEP COPY, MIGHT NOT GET METADATA! NEED TEST!
-        return self.__class__(self._data.copy(),  self.observation_ids[:],
-                              self.sample_ids[:], self.observation_metadata,
-                              self.sample_metadata, self.table_id)
+        return self.__class__(self._data.copy(),
+                              self.observation_ids.copy(),
+                              self.sample_ids.copy(),
+                              deepcopy(self.observation_metadata),
+                              deepcopy(self.sample_metadata),
+                              self.table_id)
 
     def iter_data(self, axis='sample'):
         """Yields axis values
@@ -677,7 +909,7 @@ class Table(object):
         ----------
         dense : bool
             If True, yield values as a dense vector
-        axis : str, either 'sample' or 'observation'
+        axis : {'sample', 'observation'}, optional
             The axis to iterate over
 
         Returns
@@ -713,7 +945,7 @@ class Table(object):
         ----------
         order : iterable
             The desired order for axis
-        axis : 'sample' or 'observation'
+        axis : {'sample', 'observation'}, optional
             The axis to operate on
         """
         md = []
@@ -758,7 +990,7 @@ class Table(object):
         ----------
         sort_f : function
             A function that takes a list of values and sorts it
-        axis : 'sample' or 'observation'
+        axis : {'sample', 'observation'}, optional
             The axis to operate on
         """
         if axis == 'sample':
@@ -769,50 +1001,68 @@ class Table(object):
         else:
             raise UnknownAxisError(axis)
 
-    def filter(self, ids_to_keep, axis, invert=False):
-        """Filter in place a table based on a function or iterable.
+    def filter(self, ids_to_keep, axis='sample', invert=False, inplace=True):
+        """Filter a table based on a function or iterable.
 
         Parameters
         ----------
-        ids_to_keep : function or iterable
-            If a function, it will be called with the id (a string)
-            and the dictionary of metadata of each sample, and must
+        ids_to_keep : function(id, metadata, values) -> bool, or iterable
+            If a function, it will be called with the id (a string),
+            the dictionary of metadata of each sample/observation and
+            the nonzero values of the sample/observation, and must
             return a boolean.
             If it's an iterable, it will be converted to an array of
             bools.
-        axis : str
+        axis : {'sample', 'observation'}, optional
             It controls whether to filter samples or observations. Can
             be "sample" or "observation".
         invert : bool
             If set to True, discard samples or observations where
             `ids_to_keep` returns True
+        inplace : bool, defaults to True
+            Whether to return a new table or modify itself.
+
+        Returns
+        -------
+        biom.Table
+            Returns itself if `inplace`, else returns a new filtered table.
+
+        Raises
+        ------
+        UnknownAxisError
+            If provided an unrecognized axis.
+
         """
+        table = self if inplace else self.copy()
+
         if axis == 'sample':
             axis = 1
-            ids = self.sample_ids
-            metadata = self.sample_metadata
+            ids = table.sample_ids
+            metadata = table.sample_metadata
         elif axis == 'observation':
             axis = 0
-            ids = self.observation_ids
-            metadata = self.observation_metadata
+            ids = table.observation_ids
+            metadata = table.observation_metadata
         else:
-            raise ValueError("Unsupported axis")
+            raise UnknownAxisError(axis)
 
-        arr = self._data
-        arr, ids, metadata = filter_sparse_array(arr,
-                                                 ids,
-                                                 metadata,
-                                                 ids_to_keep,
-                                                 axis,
-                                                 invert=invert)
+        arr = table._data
+        arr, ids, metadata = _filter(arr,
+                                     ids,
+                                     metadata,
+                                     ids_to_keep,
+                                     axis,
+                                     invert=invert)
 
-        self._data = arr
+        table._data = arr
         if axis == 1:
-            self.sample_ids = ids
-            self.sample_metadata = metadata
+            table.sample_ids = ids
+            table.sample_metadata = metadata
         elif axis == 0:
-            self.observation_ids = ids
-            self.observation_metadata = metadata
+            table.observation_ids = ids
+            table.observation_metadata = metadata
+
+        return table
 
     def partition(self, f, axis='sample'):
         """Yields partitions
@@ -822,7 +1072,7 @@ class Table(object):
         f : function
             ``f`` is given the ID and metadata of the vector and must return
             what partition the vector is part of.
-        axis : str, either 'sample' or 'observation'
+        axis : {'sample', 'observation'}, optional
             The axis to iterate over
 
         Returns
@@ -873,30 +1123,25 @@ class Table(object):
                 else:
                     samp_md = None
 
-            yield part, table_factory(data, obs_ids, samp_ids, obs_md, samp_md,
-                                      self.table_id)
+            yield part, Table(data, obs_ids, samp_ids, obs_md, samp_md,
+                              self.table_id, type=self.type)
 
-    def collapse_samples_by_metadata(self, metadata_f, reduce_f=add, norm=True,
-                                     min_group_size=2,
-                                     include_collapsed_metadata=True,
-                                     constructor=None, one_to_many=False,
-                                     one_to_many_mode='add',
-                                     one_to_many_md_key='Path', strict=False):
-        """Collapse samples in a table by sample metadata
+    def collapse(self, f, reduce_f=add, norm=True, min_group_size=2,
+                 include_collapsed_metadata=True, one_to_many=False,
+                 one_to_many_mode='add', one_to_many_md_key='Path',
+                 strict=False, axis='sample'):
+        """Collapse partitions in a table by metadata or by IDs
 
-        Bin samples by metadata then collapse each bin into a single sample.
+        Partition data by metadata or IDs and then collapse each partition into
+        a single vector.
 
         If ``include_collapsed_metadata`` is True, metadata for the collapsed
-        samples are retained and can be referred to by the ``SampleId`` from
-        each sample within the bin.
-
-        ``constructor``: the type of collapsed table to create, e.g.
-        SparseTaxonTable. If None, the collapsed table will be the same type as
-        this table.
+        partition are retained and can be referred to by the corresponding ID
+        from each vector within the partition.
 
         The remainder is only relevant to setting ``one_to_many`` to True.
 
-        If ``one_to_many`` is True, allow samples to collapse into multiple
+        If ``one_to_many`` is True, allow vectors to collapse into multiple
         bins if the metadata describe a one-many relationship. Supplied
         functions must allow for iteration support over the metadata key and
         must return a tuple of (path, bin) as to describe both the path in the
@@ -906,237 +1151,24 @@ class Table(object):
 
         The metadata value for the corresponding collapsed column may include
         more (or less) information about the collapsed data. For example, if
-        collapsing "FOO", and there are samples that span three associations A,
-        B, and C, such that sample 1 spans A and B, sample 2 spans B and C and
-        sample 3 spans A and C, the resulting table will contain three
-        collapsed samples:
+        collapsing "FOO", and there are vectors that span three associations A,
+        B, and C, such that vector 1 spans A and B, vector 2 spans B and C and
+        vector 3 spans A and C, the resulting table will contain three
+        collapsed vectors:
 
-        - A, containing original sample 1 and 3
-        - B, containing original sample 1 and 2
-        - C, containing original sample 2 and 3
+        - A, containing original vectors 1 and 3
+        - B, containing original vectors 1 and 2
+        - C, containing original vectors 2 and 3
 
-        If a sample maps to the same bin multiple times, it will be
+        If a vector maps to the same partition multiple times, it will be
         counted multiple times.
 
         There are two supported modes for handling one-to-many relationships
         via ``one_to_many_mode``: ``add`` and ``divide``. ``add`` will add the
-        sample counts to each bin that the sample maps to, which may increase
-        the total number of counts in the output table. ``divide`` will divide
-        a sample's counts by the number of metadata that the sample has before
-        adding the counts to each bin. This will not increase the total number
-        of counts in the output table.
-
-        If ``one_to_many_md_key`` is specified, that becomes the metadata
-        key that describes the collapsed path. If a value is not specified,
-        then it defaults to 'Path'.
-
-        If ``strict`` is specified, then all metadata pathways operated on
-        must be indexable by ``metadata_f``.
-
-        ``one_to_many`` and ``norm`` are not supported together.
-
-        ``one_to_many`` and ``reduce_f`` are not supported together.
-
-        ``one_to_many`` and ``min_group_size`` are not supported together.
-
-        A final note on space consumption. At present, the ``one_to_many``
-        functionality requires a temporary dense matrix representation. This
-        was done so as it initially seems like true support requires rapid
-        ``__setitem__`` functionality on the ``SparseObj`` and at the time of
-        implementation, ``CSMat`` was O(N) to the number of nonzero elements.
-        This is a work around until either a better ``__setitem__``
-        implementation is in play on ``CSMat`` or a hybrid solution that allows
-        for multiple ``SparseObj`` types is used.
-        """
-        if constructor is None:
-            constructor = self.__class__
-
-        collapsed_data = []
-        collapsed_sample_ids = []
-
-        if include_collapsed_metadata:
-            collapsed_sample_md = []
-        else:
-            collapsed_sample_md = None
-
-        if one_to_many_mode not in ['add', 'divide']:
-            raise ValueError("Unrecognized one-to-many mode '%s'. Must be "
-                             "either 'add' or 'divide'." % one_to_many_mode)
-
-        if one_to_many:
-            if norm:
-                raise AttributeError(
-                    "norm and one_to_many are not supported together")
-
-            # determine the collapsed pathway
-            # we drop all other associated metadata
-            new_s_md = {}
-            s_md_count = {}
-            for id_, md in zip(self.sample_ids, self.sample_metadata):
-                md_iter = metadata_f(md)
-                num_md = 0
-                while True:
-                    try:
-                        pathway, bin = md_iter.next()
-                    except IndexError:
-                        # if a pathway is incomplete
-                        if strict:
-                            # bail if strict
-                            err = "Incomplete pathway, ID: %s, metadata: %s" %\
-                                  (id_, md)
-                            raise IndexError(err)
-                        else:
-                            # otherwise ignore
-                            continue
-                    except StopIteration:
-                        break
-
-                    new_s_md[bin] = pathway
-                    num_md += 1
-
-                s_md_count[id_] = num_md
-
-            n_s = len(new_s_md)
-            s_idx = dict([(bin_, i) for i, bin_ in
-                          enumerate(sorted(new_s_md))])
-
-            # We need to store floats, not ints, as things won't always divide
-            # evenly.
-            if one_to_many_mode == 'divide':
-                dtype = float
-            else:
-                dtype = self._dtype
-
-            # allocate new data. using a dense representation allows for a
-            # workaround on CSMat.__setitem__ O(N) lookup. Assuming the number
-            # of collapsed samples is reasonable, then this doesn't suck too
-            # much.
-            new_data = zeros((len(self.observation_ids), n_s), dtype=dtype)
-
-            # for each sample
-            # for each bin in the metadata
-            # for each value associated with the sample
-            for s_v, s_id, s_md in self.iter():
-                md_iter = metadata_f(s_md)
-                while True:
-                    try:
-                        pathway, bin = md_iter.next()
-                    except IndexError:
-                        # if a pathway is incomplete
-                        if strict:
-                            # bail if strict, should never get here...
-                            err = "Incomplete pathway, ID: %s, metadata: %s" %\
-                                  (id_, md)
-                            raise IndexError(err)
-                        else:
-                            # otherwise ignore
-                            continue
-                    except StopIteration:
-                        break
-
-                    if one_to_many_mode == 'add':
-                        new_data[:, s_idx[bin]] += s_v
-                    elif one_to_many_mode == 'divide':
-                        new_data[:, s_idx[bin]] += s_v / s_md_count[s_id]
-                    else:
-                        # Should never get here.
-                        raise ValueError("Unrecognized one-to-many mode '%s'. "
-                                         "Must be either 'add' or 'divide'." %
-                                         one_to_many_mode)
-
-            if include_collapsed_metadata:
-                # reassociate pathway information
-                for k, i in sorted(s_idx.items(), key=itemgetter(1)):
-                    collapsed_sample_md.append(
-                        {one_to_many_md_key: new_s_md[k]})
-
-            # get the new sample IDs
-            collapsed_sample_ids = [k for k, i in sorted(s_idx.items(),
-                                                         key=itemgetter(1))]
-
-            # convert back to self type
-            data = self._conv_to_self_type(new_data)
-        else:
-            for bin, table in self.bin_samples_by_metadata(metadata_f):
-                if len(table.sample_ids) < min_group_size:
-                    continue
-
-                redux_data = table.reduce(reduce_f, 'observation')
-                if norm:
-                    redux_data /= len(table.sample_ids)
-
-                collapsed_data.append(self._conv_to_self_type(redux_data))
-                collapsed_sample_ids.append(bin)
-
-                if include_collapsed_metadata:
-                    # retain metadata but store by original sample id
-                    tmp_md = {}
-                    for id_, md in zip(table.sample_ids,
-                                       table.sample_metadata):
-                        tmp_md[id_] = md
-                    collapsed_sample_md.append(tmp_md)
-
-            data = self._conv_to_self_type(collapsed_data, transpose=True)
-
-        # if the table is empty
-        if 0 in data.shape:
-            raise TableException("Collapsed table is empty!")
-
-        return table_factory(data, self.observation_id[:],
-                             collapsed_sample_ids, self.observation_ids[:],
-                             self.observation_metadata, collapsed_sample_md,
-                             self.table_id, constructor=constructor)
-
-    def collapse_observations_by_metadata(self, metadata_f, reduce_f=add,
-                                          norm=True, min_group_size=2,
-                                          include_collapsed_metadata=True,
-                                          constructor=None, one_to_many=False,
-                                          one_to_many_mode='add',
-                                          one_to_many_md_key='Path',
-                                          strict=False):
-        """Collapse observations in a table by observation metadata
-
-        Bin observations by metadata then collapse each bin into a single
-        observation.
-
-        If ``include_collapsed_metadata`` is True, metadata for the collapsed
-        observations are retained and can be referred to by the
-        ``ObservationId`` from each observation within the bin.
-
-        ``constructor``: the type of collapsed table to create, e.g.
-        SparseTaxonTable. If None, the collapsed table will be the same type as
-        this table.
-
-        The remainder is only relevant to setting ``one_to_many`` to True.
-
-        If ``one_to_many`` is True, allow observations to fall into multiple
-        bins if the metadata describe a one-many relationship. Supplied
-        functions must allow for iteration support over the metadata key and
-        must return a tuple of (path, bin) as to describe both the path in the
-        hierarchy represented and the specific bin being collapsed into. The
-        uniqueness of the bin is _not_ based on the path but by the name of the
-        bin.
-
-        The metadata value for the corresponding collapsed row may include more
-        (or less) information about the collapsed data. For example, if
-        collapsing "KEGG Pathways", and there are observations that span three
-        pathways A, B, and C, such that observation 1 spans A and B,
-        observation 2 spans B and C and observation 3 spans A and C, the
-        resulting table will contain three collapsed observations:
-
-        - A, containing original observation 1 and 3
-        - B, containing original observation 1 and 2
-        - C, containing original observation 2 and 3
-
-        If an observation maps to the same bin multiple times, it will be
-        counted multiple times.
-
-        There are two supported modes for handling one-to-many relationships
-        via ``one_to_many_mode``: ``add`` and ``divide``. ``add`` will add the
-        observation counts to each bin that the observation maps to, which may
+        vector counts to each partition that the vector maps to, which may
         increase the total number of counts in the output table. ``divide``
-        will divide an observation's counts by the number of metadata that the
-        observation has before adding the counts to each bin. This will not
+        will divide a vectors's counts by the number of metadata that the
+        vector has before adding the counts to each partition. This will not
         increase the total number of counts in the output table.
 
         If ``one_to_many_md_key`` is specified, that becomes the metadata
@@ -1153,28 +1185,66 @@ class Table(object):
         ``one_to_many`` and ``min_group_size`` are not supported together.
 
         A final note on space consumption. At present, the ``one_to_many``
-        functionality requires a temporary dense matrix representation. This
-        was done so as it initially seems like true support requires rapid
-        ``__setitem__`` functionality on the ``SparseObj`` and at the time of
-        implementation, ``CSMat`` was O(N) to the number of nonzero elements.
-        This is a work around until either a better ``__setitem__``
-        implementation is in play on ``CSMat`` or a hybrid solution that allows
-        for multiple ``SparseObj`` types is used.
-        """
-        if constructor is None:
-            constructor = self.__class__
+        functionality requires a temporary dense matrix representation.
 
+        Parameters
+        ----------
+        f : function
+            Function that is used to determine what partition a vector belongs
+            to
+        reduce_f : function
+            Function that reduces two vectors in a one-to-one collapse
+        norm : bool
+            If `True`, normalize the resulting table
+        min_group_size : int
+            The minimum size of a partition of performing a one-to-many
+            collapse
+        include_collapsed_metadata : bool
+            If `True`, retain the collapsed metadata keyed by the original IDs
+            of the associated vectors
+        one_to_many : bool
+            Perform a one-to-many collapse
+        one_to_many_mode : str, 'add' or 'divide'
+            The way to reduce two vectors in a one-to-many collapse
+        one_to_many_md_key : str
+            The if `include_collapsed_metadata` is `True`, store the original
+            vector metadata under this key
+        strict : bool
+            Requires full pathway data within a one-to-many structure
+
+        Returns
+        -------
+        Table
+            The collapsed table
+
+        """
         collapsed_data = []
-        collapsed_obs_ids = []
+        collapsed_ids = []
 
         if include_collapsed_metadata:
-            collapsed_obs_md = []
+            collapsed_md = []
         else:
-            collapsed_obs_md = None
+            collapsed_md = None
 
         if one_to_many_mode not in ['add', 'divide']:
             raise ValueError("Unrecognized one-to-many mode '%s'. Must be "
                              "either 'add' or 'divide'." % one_to_many_mode)
+
+        # transpose is only necessary in the one-to-one case
+        # new_data_shape is only necessary in the one-to-many case
+        # axis_slice is only necessary in the one-to-many case
+        if axis == 'sample':
+            axis_ids_md = lambda t: (t.sample_ids, t.sample_metadata)
+            transpose = True
+            new_data_shape = lambda ids, collapsed: (len(ids), len(collapsed))
+            axis_slice = lambda lookup, key: (slice(None), lookup[key])
+        elif axis == 'observation':
+            axis_ids_md = lambda t: (t.observation_ids, t.observation_metadata)
+            transpose = False
+            new_data_shape = lambda ids, collapsed: (len(collapsed), len(ids))
+            axis_slice = lambda lookup, key: (lookup[key], slice(None))
+        else:
+            raise UnknownAxisError(axis)
 
         if one_to_many:
             if norm:
@@ -1183,15 +1253,15 @@ class Table(object):
 
             # determine the collapsed pathway
             # we drop all other associated metadata
-            new_obs_md = {}
-            obs_md_count = {}
-            for id_, md in zip(self.observation_ids,
-                               self.observation_metadata):
-                md_iter = metadata_f(md)
+            new_md = {}
+            md_count = {}
+
+            for id_, md in izip(*axis_ids_md(self)):
+                md_iter = f(id_, md)
                 num_md = 0
                 while True:
                     try:
-                        pathway, bin = md_iter.next()
+                        pathway, partition = md_iter.next()
                     except IndexError:
                         # if a pathway is incomplete
                         if strict:
@@ -1205,37 +1275,29 @@ class Table(object):
                     except StopIteration:
                         break
 
-                    # keyed by last field in hierarchy
-                    new_obs_md[bin] = pathway
+                    new_md[partition] = pathway
                     num_md += 1
 
-                obs_md_count[id_] = num_md
+                md_count[id_] = num_md
 
-            n_obs = len(new_obs_md)
-            obs_idx = dict([(bin_, i)
-                            for i, bin_ in enumerate(sorted(new_obs_md))])
+            idx_lookup = {part: i for i, part in enumerate(sorted(new_md))}
 
             # We need to store floats, not ints, as things won't always divide
             # evenly.
-            if one_to_many_mode == 'divide':
-                dtype = float
-            else:
-                dtype = self._dtype
+            dtype = float if one_to_many_mode == 'divide' else self.dtype
 
-            # allocate new data. using a dense representation allows for a
-            # workaround on CSMat.__setitem__ O(N) lookup. Assuming the number
-            # of collapsed observations is reasonable, then this doesn't suck
-            # too much.
-            new_data = zeros((n_obs, len(self.sample_ids)), dtype=dtype)
+            new_data = zeros(new_data_shape(axis_ids_md(self)[0], new_md),
+                             dtype=dtype)
 
-            # for each observation
+            # for each vector
             # for each bin in the metadata
-            # for each value associated with the observation
-            for obs_v, obs_id, obs_md in self.iter(axis='observation'):
-                md_iter = metadata_f(obs_md)
+            # for each partition associated with the vector
+            for vals, id_, md in self.iter(axis=axis):
+                md_iter = f(id_, md)
+
                 while True:
                     try:
-                        pathway, bin = md_iter.next()
+                        pathway, part = md_iter.next()
                     except IndexError:
                         # if a pathway is incomplete
                         if strict:
@@ -1250,60 +1312,117 @@ class Table(object):
                         break
 
                     if one_to_many_mode == 'add':
-                        new_data[obs_idx[bin], :] += obs_v
-                    elif one_to_many_mode == 'divide':
-                        new_data[obs_idx[bin], :] += \
-                            obs_v / obs_md_count[obs_id]
+                        new_data[axis_slice(idx_lookup, part)] += vals
                     else:
-                        # Should never get here.
-                        raise ValueError("Unrecognized one-to-many mode '%s'. "
-                                         "Must be either 'add' or 'divide'." %
-                                         one_to_many_mode)
+                        new_data[axis_slice(idx_lookup, part)] += \
+                            vals / md_count[id_]
 
             if include_collapsed_metadata:
-                # associate the pathways back
-                for k, i in sorted(obs_idx.items(), key=itemgetter(1)):
-                    collapsed_obs_md.append(
-                        {one_to_many_md_key: new_obs_md[k]})
+                # reassociate pathway information
+                for k, i in sorted(idx_lookup.iteritems(), key=itemgetter(1)):
+                    collapsed_md.append({one_to_many_md_key: new_md[k]})
 
-            # get the new observation IDs
-            collapsed_obs_ids = [k for k, i in sorted(obs_idx.items(),
-                                                      key=itemgetter(1))]
+            # get the new sample IDs
+            collapsed_ids = [k for k, i in sorted(idx_lookup.iteritems(),
+                                                  key=itemgetter(1))]
 
             # convert back to self type
             data = self._conv_to_self_type(new_data)
         else:
-            for bin, table in self.bin_observations_by_metadata(metadata_f):
-                if len(table.observation_ids) < min_group_size:
+            for part, table in self.partition(f, axis=axis):
+                axis_ids, axis_md = axis_ids_md(table)
+
+                if len(axis_ids) < min_group_size:
                     continue
 
-                redux_data = table.reduce(reduce_f, 'sample')
+                redux_data = table.reduce(reduce_f, self._invert_axis(axis))
                 if norm:
-                    redux_data /= len(table.observation_ids)
+                    redux_data /= len(axis_ids)
 
                 collapsed_data.append(self._conv_to_self_type(redux_data))
-                collapsed_obs_ids.append(bin)
+                collapsed_ids.append(part)
 
                 if include_collapsed_metadata:
-                    # retain metadata but store by original observation id
+                    # retain metadata but store by original id
                     tmp_md = {}
-                    for id_, md in zip(table.observation_ids,
-                                       table.observation_metadata):
+                    for id_, md in izip(axis_ids, axis_md):
                         tmp_md[id_] = md
-                    collapsed_obs_md.append(tmp_md)
+                    collapsed_md.append(tmp_md)
 
-            data = self._conv_to_self_type(collapsed_data)
+            data = self._conv_to_self_type(collapsed_data, transpose=transpose)
 
         # if the table is empty
         if 0 in data.shape:
             raise TableException("Collapsed table is empty!")
 
-        return table_factory(data, collapsed_obs_ids, self.sample_ids[:],
-                             self.sample_metadata, collapsed_obs_md,
-                             self.table_id,
-                             constructor=constructor)
+        if axis == 'sample':
+            sample_ids = collapsed_ids
+            sample_md = collapsed_md
+            obs_ids = self.observation_ids[:]
+            if self.observation_metadata is not None:
+                obs_md = self.observation_metadata[:]
+            else:
+                obs_md = None
+        else:
+            sample_ids = self.sample_ids[:]
+            obs_ids = collapsed_ids
+            obs_md = collapsed_md
+            if self.sample_metadata is not None:
+                sample_md = self.sample_metadata[:]
+            else:
+                sample_md = None
 
-    def transform(self, f, axis='sample'):
+        return Table(data, obs_ids, sample_ids, obs_md, sample_md,
+                     self.table_id, type=self.type)
+
+    def _invert_axis(self, axis):
+        """Invert an axis"""
+        if axis == 'sample':
+            return 'observation'
+        elif axis == 'observation':
+            return 'sample'
+        else:
+            return UnknownAxisError(axis)
+
+    def pa(self, inplace=True):
+        """Convert the `Table` to presence/absence data
+
+        Parameters
+        ----------
+        inplace : bool, optional
+            Defaults to `False`
+
+        Returns
+        -------
+        biom.Table
+            Returns itself if `inplace`, else returns a new presence/absence
+            table.
+
+        Examples
+        --------
+        >>> import numpy as np
+        >>> from biom.table import Table
+
+        Create a 2x3 BIOM table
+
+        >>> data = np.asarray([[0, 0, 1], [1, 3, 42]])
+        >>> table = table = Table(data, ['O1', 'O2'], ['S1', 'S2', 'S3'])
+
+        Convert to presence/absence data
+
+        >>> _ = table.pa()
+        >>> print table.data('O1', 'observation')
+        [ 0.  0.  1.]
+        >>> print table.data('O2', 'observation')
+        [ 1.  1.  1.]
+
+        """
+        def transform_f(data, id_, metadata):
+            return np.ones(len(data), dtype=float)
+
+        return self.transform(transform_f, inplace=inplace)
+
+    def transform(self, f, axis='sample', inplace=True):
         """Iterate over `axis`, applying a function `f` to each vector.
 
         Only non null values can be modified: the density of the table
@@ -1311,39 +1430,55 @@ class Table(object):
 
         Parameters
         ----------
-        f : function
+        f : function(data, id, metadata) -> new data
             A function that takes three values: an array of nonzero
             values corresponding to each observation or sample, an
             observation or sample id, and an observation or sample
             metadata entry. It must return an array of transformed
             values that replace the original values.
-        axis : 'sample' or 'observation'
-            The axis to operate on.
+        axis : {'sample', 'observation'}, optional
+            The axis to operate on. Can be "sample" or "observation".
+        inplace : bool, defaults to True
+            Whether to return a new table or modify itself.
+
+        Returns
+        -------
+        biom.Table
+            Returns itself if `inplace`, else returns a new transformed table.
+
+        Raises
+        ------
+        UnknownAxisError
+            If provided an unrecognized axis.
         """
+        table = self if inplace else self.copy()
+
         if axis == 'sample':
             axis = 1
-            ids = self.sample_ids
-            metadata = self.sample_metadata
-            arr = self._data.tocsc()
+            ids = table.sample_ids
+            metadata = table.sample_metadata
+            arr = table._data.tocsc()
         elif axis == 'observation':
             axis = 0
-            ids = self.observation_ids
-            metadata = self.observation_metadata
-            arr = self._data.tocsr()
+            ids = table.observation_ids
+            metadata = table.observation_metadata
+            arr = table._data.tocsr()
         else:
             raise UnknownAxisError(axis)
 
         _transform(arr, ids, metadata, f, axis)
         arr.eliminate_zeros()
 
-        self._data = arr
+        table._data = arr
+
+        return table
 
     def norm(self, axis='sample'):
         """Normalize in place sample values by an observation, or vice versa.
 
         Parameters
         ----------
-        axis : 'sample' or 'observation'
+        axis : {'sample', 'observation'}, optional
             The axis to use for normalization
         """
         def f(val, id_, _):
@@ -1619,26 +1754,31 @@ class Table(object):
         ### ALL THESE INTS CAN BE UINT, SCIPY DOES NOT BY DEFAULT STORE AS THIS
         ###     THOUGH
         ### METADATA ARE NOT REPRESENTED HERE YET
-        ./id                     : str, an arbitrary ID
-        ./type                   : str, the table type (e.g, OTU table)
-        ./format-url             : str, a URL that describes the format
-        ./format-version         : two element tuple of int32, major and minor
-        ./generated-by           : str, what generated this file
-        ./creation-date          : str, ISO format
-        ./shape                  : two element tuple of int32, N by M
-        ./nnz                    : int32 or int64, number of non zero elements
-        ./observation            : Group
-        ./observation/ids        : (N,) dataset of str or vlen str
-        ./observation/data       : (N,) dataset of float64
-        ./observation/indices    : (N,) dataset of int32
-        ./observation/indptr     : (M+1,) dataset of int32
-        [./observation/metadata] : Optional, JSON str, in index order with ids
-        ./sample                 : Group
-        ./sample/ids             : (M,) dataset of str or vlen str
-        ./sample/data            : (M,) dataset of float64
-        ./sample/indices         : (M,) dataset of int32
-        ./sample/indptr          : (N+1,) dataset of int32
-        [./sample/metadata]      : Optional, JSON str, in index order with ids
+        ./id                         : str, an arbitrary ID
+        ./type                       : str, the table type (e.g, OTU table)
+        ./format-url                 : str, a URL that describes the format
+        ./format-version             : two element tuple of int32,
+                                       major and minor
+        ./generated-by               : str, what generated this file
+        ./creation-date              : str, ISO format
+        ./shape                      : two element tuple of int32, N by M
+        ./nnz                        : int32 or int64, number of non zero elems
+        ./observation                : Group
+        ./observation/ids            : (N,) dataset of str or vlen str
+        ./observation/matrix         : Group
+        ./observation/matrix/data    : (N,) dataset of float64
+        ./observation/matrix/indices : (N,) dataset of int32
+        ./observation/matrix/indptr  : (M+1,) dataset of int32
+        [./observation/metadata]     : Optional, JSON str, in index order
+                                       with ids
+        ./sample                     : Group
+        ./sample/ids                 : (M,) dataset of str or vlen str
+        ./sample/matrix              : Group
+        ./sample/matrix/data         : (M,) dataset of float64
+        ./sample/matrix/indices      : (M,) dataset of int32
+        ./sample/matrix/indptr       : (N+1,) dataset of int32
+        [./sample/metadata]          : Optional, JSON str, in index order
+                                       with ids
 
         Paramters
         ---------
@@ -1667,6 +1807,9 @@ class Table(object):
         if order not in ('observation', 'sample'):
             raise ValueError("Unknown order %s!" % order)
 
+        create_date = h5grp.attrs['creation-date']
+        generated_by = h5grp.attrs['generated-by']
+
         shape = h5grp.attrs['shape']
         type = None if h5grp.attrs['type'] == '' else h5grp.attrs['type']
 
@@ -1680,10 +1823,10 @@ class Table(object):
         samp_md = loads(h5grp['sample'].get('metadata', no_md)[0])
 
         # load the data
-        data_path = partial(os.path.join, order)
-        data = h5grp[data_path("data")]
-        indices = h5grp[data_path("indices")]
-        indptr = h5grp[data_path("indptr")]
+        data_grp = h5grp[order]['matrix']
+        data = data_grp["data"]
+        indices = data_grp["indices"]
+        indptr = data_grp["indptr"]
         cs = (data, indices, indptr)
 
         if order == 'sample':
@@ -1691,8 +1834,9 @@ class Table(object):
         else:
             matrix = csr_matrix(cs, shape=shape)
 
-        return table_factory(matrix, obs_ids, samp_ids,  obs_md or None,
-                             samp_md or None, type=type)
+        return Table(matrix, obs_ids, samp_ids,  obs_md or None,
+                     samp_md or None, type=type, create_date=create_date,
+                     generated_by=generated_by)
 
     def to_hdf5(self, h5grp, generated_by, compress=True):
         """Store CSC and CSR in place
@@ -1708,26 +1852,31 @@ class Table(object):
         ### ALL THESE INTS CAN BE UINT, SCIPY DOES NOT BY DEFAULT STORE AS THIS
         ###     THOUGH
         ### METADATA ARE NOT REPRESENTED HERE YET
-        ./id                     : str, an arbitrary ID
-        ./type                   : str, the table type (e.g, OTU table)
-        ./format-url             : str, a URL that describes the format
-        ./format-version         : two element tuple of int32, major and minor
-        ./generated-by           : str, what generated this file
-        ./creation-date          : str, ISO format
-        ./shape                  : two element tuple of int32, N by M
-        ./nnz                    : int32 or int64, number of non zero elements
-        ./observation            : Group
-        ./observation/ids        : (N,) dataset of str or vlen str
-        ./observation/data       : (N,) dataset of float64
-        ./observation/indices    : (N,) dataset of int32
-        ./observation/indptr     : (M+1,) dataset of int32
-        [./observation/metadata] : Optional, JSON str, in index order with ids
-        ./sample                 : Group
-        ./sample/ids             : (M,) dataset of str or vlen str
-        ./sample/data            : (M,) dataset of float64
-        ./sample/indices         : (M,) dataset of int32
-        ./sample/indptr          : (N+1,) dataset of int32
-        [./sample/metadata]      : Optional, JSON str, in index order with ids
+        ./id                         : str, an arbitrary ID
+        ./type                       : str, the table type (e.g, OTU table)
+        ./format-url                 : str, a URL that describes the format
+        ./format-version             : two element tuple of int32,
+                                       major and minor
+        ./generated-by               : str, what generated this file
+        ./creation-date              : str, ISO format
+        ./shape                      : two element tuple of int32, N by M
+        ./nnz                        : int32 or int64, number of non zero elems
+        ./observation                : Group
+        ./observation/ids            : (N,) dataset of str or vlen str
+        ./observation/matrix         : Group
+        ./observation/matrix/data    : (N,) dataset of float64
+        ./observation/matrix/indices : (N,) dataset of int32
+        ./observation/matrix/indptr  : (M+1,) dataset of int32
+        [./observation/metadata]     : Optional, JSON str, in index order
+                                       with ids
+        ./sample                     : Group
+        ./sample/ids                 : (M,) dataset of str or vlen str
+        ./sample/matrix              : Group
+        ./sample/matrix/data         : (M,) dataset of float64
+        ./sample/matrix/indices      : (M,) dataset of int32
+        ./sample/matrix/indptr       : (N+1,) dataset of int32
+        [./sample/metadata]          : Optional, JSON str, in index order
+                                       with ids
 
         Paramters
         ---------
@@ -1757,15 +1906,17 @@ class Table(object):
             len_indptr = len(self._data.indptr)
             len_data = self.nnz
 
-            grp.create_dataset('data', shape=(len_data,),
+            grp.create_group('matrix')
+
+            grp.create_dataset('matrix/data', shape=(len_data,),
                                dtype=np.float64,
                                data=self._data.data,
                                compression=compression)
-            grp.create_dataset('indices', shape=(len_data,),
+            grp.create_dataset('matrix/indices', shape=(len_data,),
                                dtype=np.int32,
                                data=self._data.indices,
                                compression=compression)
-            grp.create_dataset('indptr', shape=(len_indptr,),
+            grp.create_dataset('matrix/indptr', shape=(len_indptr,),
                                dtype=np.int32,
                                data=self._data.indptr,
                                compression=compression)
@@ -1801,89 +1952,32 @@ class Table(object):
         axis_dump(h5grp.create_group('sample'), self.sample_ids,
                   self.sample_metadata, 'csc', compression)
 
-    def get_biom_format_object(self, generated_by):
-        """Returns a dictionary representing the table in BIOM format.
+    @classmethod
+    def from_json(self, json_table, data_pump=None,
+                  input_is_dense=False):
+        """Parse a biom otu table type"""
+        sample_ids = [col['id'] for col in json_table['columns']]
+        sample_metadata = [col['metadata'] for col in json_table['columns']]
+        obs_ids = [row['id'] for row in json_table['rows']]
+        obs_metadata = [row['metadata'] for row in json_table['rows']]
+        dtype = MATRIX_ELEMENT_TYPE[json_table['matrix_element_type']]
 
-        This dictionary can then be easily converted into a JSON string for
-        serialization.
-
-        ``generated_by``: a string describing the software used to build the
-        table
-
-        TODO: This method may be very inefficient in terms of memory usage, so
-        it needs to be tested with several large tables to determine if
-        optimizations are necessary or not (i.e. subclassing JSONEncoder, using
-        generators, etc...).
-        """
-        if (not isinstance(generated_by, str) and
-                not isinstance(generated_by, unicode)):
-            raise TableException("Must specify a generated_by string")
-
-        # Fill in top-level metadata.
-        biom_format_obj = {}
-        biom_format_obj["id"] = self.table_id
-        biom_format_obj["format"] = get_biom_format_version_string()
-        biom_format_obj["format_url"] =\
-            get_biom_format_url_string()
-        biom_format_obj["generated_by"] = generated_by
-        biom_format_obj["date"] = "%s" % datetime.now().isoformat()
-
-        # Determine if we have any data in the matrix, and what the shape of
-        # the matrix is.
-        try:
-            num_rows, num_cols = self.shape
-        except:
-            num_rows = num_cols = 0
-        has_data = True if num_rows > 0 and num_cols > 0 else False
-
-        # Default the matrix element type to test to be an integer in case we
-        # don't have any data in the matrix to test.
-        test_element = 0
-        if has_data:
-            test_element = self[0, 0]
-
-        # Determine the type of elements the matrix is storing.
-        if isinstance(test_element, int):
-            dtype, matrix_element_type = int, "int"
-        elif isinstance(test_element, float):
-            dtype, matrix_element_type = float, "float"
-        elif isinstance(test_element, unicode):
-            dtype, matrix_element_type = unicode, "unicode"
+        if data_pump is None:
+            table_obj = Table(json_table['data'], obs_ids, sample_ids,
+                              obs_metadata, sample_metadata,
+                              shape=json_table['shape'],
+                              dtype=dtype,
+                              input_is_dense=input_is_dense)
         else:
-            raise TableException("Unsupported matrix data type.")
+            table_obj = Table(data_pump, obs_ids, sample_ids,
+                              obs_metadata, sample_metadata,
+                              shape=json_table['shape'],
+                              dtype=dtype,
+                              input_is_dense=input_is_dense)
 
-        # Fill in details about the matrix.
-        biom_format_obj["matrix_element_type"] = "%s" % matrix_element_type
-        biom_format_obj["shape"] = [num_rows, num_cols]
+        return table_obj
 
-        # Fill in details about the rows in the table and fill in the matrix's
-        # data.
-        biom_format_obj["rows"] = []
-        biom_format_obj["data"] = []
-        for obs_index, obs in enumerate(self.iter(axis='observation')):
-            biom_format_obj["rows"].append(
-                {"id": "%s" % obs[1], "metadata": obs[2]})
-            # If the matrix is dense, simply convert the numpy array to a list
-            # of data values. If the matrix is sparse, we need to store the
-            # data in sparse format, as it is given to us in a numpy array in
-            # dense format (i.e. includes zeroes) by iter().
-            dense_values = list(obs[0])
-            sparse_values = []
-            for col_index, val in enumerate(dense_values):
-                if float(val) != 0.0:
-                    sparse_values.append([obs_index, col_index,
-                                          dtype(val)])
-            biom_format_obj["data"].extend(sparse_values)
-
-        # Fill in details about the columns in the table.
-        biom_format_obj["columns"] = []
-        for samp in self.iter():
-            biom_format_obj["columns"].append(
-                {"id": "%s" % samp[1], "metadata": samp[2]})
-
-        return biom_format_obj
-
-    def get_biom_format_json_string(self, generated_by, direct_io=None):
+    def to_json(self, generated_by, direct_io=None):
         """Returns a JSON string representing the table in BIOM format.
 
         ``generated_by``: a string describing the software used to build the
@@ -1964,11 +2058,11 @@ class Table(object):
         for obs_index, obs in enumerate(self.iter(axis='observation')):
             # i'm crying on the inside
             if obs_index != max_row_idx:
-                rows.append('{"id": "%s", "metadata": %s},' % (obs[1],
-                                                               dumps(obs[2])))
+                rows.append('{"id": %s, "metadata": %s},' % (dumps(obs[1]),
+                                                             dumps(obs[2])))
             else:
-                rows.append('{"id": "%s", "metadata": %s}],' % (obs[1],
-                                                                dumps(obs[2])))
+                rows.append('{"id": %s, "metadata": %s}],' % (dumps(obs[1]),
+                                                              dumps(obs[2])))
 
             # turns out its a pain to figure out when to place commas. the
             # simple work around, at the expense of a little memory
@@ -2003,13 +2097,11 @@ class Table(object):
         columns = ['"columns": [']
         for samp_index, samp in enumerate(self.iter()):
             if samp_index != max_col_idx:
-                columns.append('{"id": "%s", "metadata": %s},' % (samp[1],
-                                                                  dumps(
-                                                                  samp[2])))
+                columns.append('{"id": %s, "metadata": %s},' % (
+                    dumps(samp[1]), dumps(samp[2])))
             else:
-                columns.append('{"id": "%s", "metadata": %s}]' % (samp[1],
-                                                                  dumps(
-                                                                  samp[2])))
+                columns.append('{"id": %s, "metadata": %s}]' % (
+                    dumps(samp[1]), dumps(samp[2])))
 
         rows = ''.join(rows)
         columns = ''.join(columns)
@@ -2024,205 +2116,211 @@ class Table(object):
                                      matrix_element_type, shape,
                                      ''.join(data), rows, columns])
 
-    def get_biom_format_pretty_print(self, generated_by):
-        """Returns a 'pretty print' format of a BIOM file
+    @staticmethod
+    def from_tsv(lines, obs_mapping, sample_mapping,
+                 process_func, **kwargs):
+        """Parse an tab separated (observation x sample) formatted BIOM table
 
-        ``generated_by``: a string describing the software used to build the
-        table
+        Parameters
+        ----------
+        lines : list, or file-like object
+            The tab delimited data to parse
+        obs_mapping : dict or None
+            The corresponding observation metadata
+        sample_mapping : dict or None
+            The corresponding sample metadata
+        process_func : function
+            A function to transform the observation metadata
 
-        WARNING: This method displays data values in a columnar format and
-        can be misleading.
+        Returns
+        -------
+        Table
+            A BIOM ``Table`` object
+
+        Examples
+        --------
+        >>> from biom.table import Table
+        >>> from StringIO import StringIO
+        >>> tsv = 'a\\tb\\tc\\n1\\t2\\t3\\n4\\t5\\t6'
+        >>> tsv_fh = StringIO(tsv)
+        >>> func = lambda x : x
+        >>> test_table = Table.from_tsv(tsv_fh, None, None, func)
         """
-        return dumps(self.get_biom_format_object(generated_by), sort_keys=True,
-                     indent=4)
 
+        (sample_ids, obs_ids, data, t_md,
+            t_md_name) = Table._extract_data_from_tsv(lines, **kwargs)
 
-def list_list_to_nparray(data, dtype=float):
-    """Convert a list of lists into a nparray
+        # if we have it, keep it
+        if t_md is None:
+            obs_metadata = None
+        else:
+            obs_metadata = [{t_md_name: process_func(v)} for v in t_md]
 
-    [[value, value, ..., value], ...]
-    """
-    return asarray(data, dtype=dtype)
+        if sample_mapping is None:
+            sample_metadata = None
+        else:
+            sample_metadata = [sample_mapping[sample_id]
+                               for sample_id in sample_ids]
 
+        # will override any metadata from parsed table
+        if obs_mapping is not None:
+            obs_metadata = [obs_mapping[obs_id] for obs_id in obs_ids]
 
-def dict_to_nparray(data, dtype=float):
-    """Takes a dict {(row,col):val} and creates a numpy matrix"""
-    rows, cols = zip(*data)  # unzip
-    mat = zeros((max(rows) + 1, max(cols) + 1), dtype=dtype)
+        return Table(data, obs_ids, sample_ids, obs_metadata, sample_metadata)
 
-    for (row, col), val in data.iteritems():
-        mat[row, col] = val
+    @staticmethod
+    def _extract_data_from_tsv(lines, delim='\t', dtype=float,
+                               header_mark=None, md_parse=None):
+        """Parse a classic table into (sample_ids, obs_ids, data, metadata,
+                                       name)
+        Returns
+        -------
+        list
+            sample_ids
+        list
+            observation_ids
+        array
+            data
+        list
+            metadata
+        string
+            column name if last column is non-numeric
 
-    return mat
+        Parameters
+        ----------
+        lines: list or file-like object
+            delimted data to parse
+        delim: string
+            delimeter in file lines
+        dtype: type
+        header_mark:  string or None
+            string that indicates start of header line
+        md_parse:  function or None
+            funtion used to parse metdata
 
+        Notes
+        ------
+        This is intended to be close to how QIIME classic OTU tables are
+        parsed with the exception of the additional md_name field
 
-def list_dict_to_nparray(data, dtype=float):
-    """Takes a list of dicts {(0,col):val} and creates an numpy matrix
+        This function is ported from QIIME (http://www.qiime.org), previously
+        named
+        parse_classic_otu_table. QIIME is a GPL project, but we obtained
+        permission
+        from the authors of this function to port it to the BIOM Format project
+        (and keep it under BIOM's BSD license).
+        """
+        if not isinstance(lines, list):
+            try:
+                lines = lines.readlines()
+            except AttributeError:
+                raise RuntimeError(
+                    "Input needs to support readlines or be indexable")
 
-    Expects each dict to represent a row vector
-    """
-    n_rows = len(data)
-    n_cols = max(flatten([d.keys() for d in data]), key=itemgetter(1))[1] + 1
+        # find header, the first line that is not empty and does not start
+        # with a #
+        for idx, l in enumerate(lines):
+            if not l.strip():
+                continue
+            if not l.startswith('#'):
+                break
+            if header_mark and l.startswith(header_mark):
+                break
 
-    mat = zeros((n_rows, n_cols), dtype=dtype)
-
-    for row_idx, row in enumerate(data):
-        for (_, col_idx), val in row.iteritems():
-            mat[row_idx, col_idx] = val
-
-    return mat
-
-
-def table_factory(data, observation_ids, sample_ids, observation_metadata=None,
-                  sample_metadata=None, table_id=None,
-                  input_is_dense=False, transpose=False, **kwargs):
-    """Construct a table
-
-    Attempts to make 'data' through various means of juggling. Data can be:
-
-        - numpy.array
-        - list of numpy.array vectors
-        - SparseObj representation
-        - dict representation
-        - list of SparseObj representation vectors
-        - list of lists of sparse values [[row, col, value], ...]
-        - list of lists of dense values [[value, value, ...], ...]
-        - Scipy COO data (values, (rows, cols))
-
-    Example usage to create a Table object::
-
-        from biom.table import table_factory
-        from numpy import array
-
-        sample_ids = ['s1','s2','s3','s4']
-        sample_md = [{'pH':4.2,'country':'Peru'},
-                     {'pH':5.2,'country':'Peru'},
-                     {'pH':5.0,'country':'Peru'},
-                     {'pH':4.9,'country':'Peru'}]
-
-        observation_ids = ['o1','o2','o3']
-        observation_md = [{'domain':'Archaea'},
-                          {'domain':'Bacteria'},
-                          {'domain':'Bacteria'}]
-
-        data = array([[1,2,3,4],
-                      [-1,6,7,8],
-                      [9,10,11,12]])
-
-        t = table_factory(data,
-                          observation_ids,
-                          sample_ids,
-                          observation_md,
-                          sample_md)
-    """
-    if 'dtype' in kwargs:
-        dtype = kwargs['dtype']
-    else:
-        dtype = float
-
-    if 'shape' in kwargs:
-        shape = kwargs['shape']
-    else:
-        shape = None
-
-    # if we have a numpy array
-    if isinstance(data, ndarray):
-        data = nparray_to_sparse(data, dtype)
-
-    # if we have a list of things
-    elif isinstance(data, list):
-        if not data:
-            raise TableException("No data was supplied. Cannot create "
-                                 "an empty table.")
-
-        elif isinstance(data[0], ndarray):
-            data = list_nparray_to_sparse(data, dtype)
-
-        elif isinstance(data[0], dict):
-            data = list_dict_to_sparse(data, dtype)
-
-        elif isinstance(data[0], list):
-            if input_is_dense:
-                d = coo_matrix(data)
-                data = coo_arrays_to_sparse((d.data, (d.row, d.col)),
-                                            dtype=dtype)
+        if idx == 0:
+            data_start = 1
+            header = lines[0].strip().split(delim)[1:]
+        else:
+            if header_mark is not None:
+                data_start = idx + 1
+                header = lines[idx].strip().split(delim)[1:]
             else:
-                data = list_list_to_sparse(data, dtype, shape=shape)
+                data_start = idx
+                header = lines[idx - 1].strip().split(delim)[1:]
 
+        # attempt to determine if the last column is non-numeric, ie, metadata
+        first_values = lines[data_start].strip().split(delim)
+        last_value = first_values[-1]
+        last_column_is_numeric = True
+
+        if '.' in last_value:
+            try:
+                float(last_value)
+            except ValueError:
+                last_column_is_numeric = False
         else:
-            raise TableException("Unknown nested list type")
+            try:
+                int(last_value)
+            except ValueError:
+                last_column_is_numeric = False
 
-    # if we have a dict representation
-    elif isinstance(data, dict):
-        data = dict_to_sparse(data, dtype)
-
-    elif isinstance(data, tuple) and isinstance(data[0], ndarray):
-        data = coo_arrays_to_sparse(data)
-
-    elif isspmatrix(data):
-        pass
-
-    else:
-        raise TableException("Cannot handle data!")
-
-    return Table(data, observation_ids, sample_ids,
-                 sample_metadata=sample_metadata,
-                 observation_metadata=observation_metadata,
-                 table_id=table_id, **kwargs)
-
-
-def to_sparse(values, transpose=False, dtype=float):
-    """Try to return a populated scipy.sparse matrix.
-
-    NOTE: assumes the max value observed in row and col defines the size of the
-    matrix.
-    """
-    # if it is a vector
-    if isinstance(values, ndarray) and len(values.shape) == 1:
-        if transpose:
-            mat = nparray_to_sparse(values[:, newaxis], dtype)
+        # determine sample ids
+        if last_column_is_numeric:
+            md_name = None
+            metadata = None
+            samp_ids = header[:]
         else:
-            mat = nparray_to_sparse(values, dtype)
-        return mat
-    if isinstance(values, ndarray):
-        if transpose:
-            mat = nparray_to_sparse(values.T, dtype)
-        else:
-            mat = nparray_to_sparse(values, dtype)
-        return mat
-    # the empty list
-    elif isinstance(values, list) and len(values) == 0:
-        return coo_matrix((0, 0))
-    # list of np vectors
-    elif isinstance(values, list) and isinstance(values[0], ndarray):
-        mat = list_nparray_to_sparse(values, dtype)
-        if transpose:
-            mat = mat.T
-        return mat
-    # list of dicts, each representing a row in row order
-    elif isinstance(values, list) and isinstance(values[0], dict):
-        mat = list_dict_to_sparse(values, dtype)
-        if transpose:
-            mat = mat.T
-        return mat
-    # list of scipy.sparse matrices, each representing a row in row order
-    elif isinstance(values, list) and isspmatrix(values[0]):
-        mat = list_sparse_to_sparse(values, dtype)
-        if transpose:
-            mat = mat.T
-        return mat
-    elif isinstance(values, dict):
-        mat = dict_to_sparse(values, dtype)
-        if transpose:
-            mat = mat.T
-        return mat
-    elif isspmatrix(values):
-        mat = values
-        if transpose:
-            mat = mat.transpose()
-        return mat
-    else:
-        raise TableException("Unknown input type")
+            md_name = header[-1]
+            metadata = []
+            samp_ids = header[:-1]
+
+        data = []
+        obs_ids = []
+        for line in lines[data_start:]:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith('#'):
+                continue
+
+            fields = line.strip().split(delim)
+            obs_ids.append(fields[0])
+
+            if last_column_is_numeric:
+                values = map(dtype, fields[1:])
+            else:
+                values = map(dtype, fields[1:-1])
+
+                if md_parse is not None:
+                    metadata.append(md_parse(fields[-1]))
+                else:
+                    metadata.append(fields[-1])
+
+            data.append(values)
+
+        return samp_ids, obs_ids, asarray(data), metadata, md_name
+
+    def to_tsv(self, header_key=None, header_value=None,
+               metadata_formatter=str, observation_column_name='#OTU ID'):
+        """Return self as a string in tab delimited form
+
+        Default ``str`` output for the ``Table`` is just row/col ids and table
+        data without any metadata
+
+        Parameters
+        ----------
+        header_key : string or None
+        header_value : string or None
+        metadata_formatter : function
+            a function which takes a metadata entry and
+            returns a formatted version that should be written to file
+        observation_column_name : string
+            the name of the first column in the output
+            table, corresponding to the observation IDs.
+
+        Returns
+        -------
+        string
+            tab delimited represtation of the Table
+            For example, the default will look something like:
+                #OTU ID\tSample1\tSample2
+                OTU1\t10\t2
+                OTU2\t4\t8
+
+        """
+        return self.delimited_self('\t', header_key, header_value,
+                                   metadata_formatter,
+                                   observation_column_name)
 
 
 def coo_arrays_to_sparse(data, dtype=np.float64, shape=None):
@@ -2272,7 +2370,19 @@ def list_list_to_sparse(data, dtype=float, shape=None):
 
 def nparray_to_sparse(data, dtype=float):
     """Convert a numpy array to a scipy.sparse matrix."""
-    if len(data.shape) == 1:
+    if data.shape == (0,):
+        # an empty vector. Note, this short circuit is necessary as calling
+        # csr_matrix([], shape=(0, 0), dtype=dtype) will result in a matrix
+        # has a shape of (1, 0).
+        return csr_matrix((0, 0), dtype=dtype)
+    elif data.shape in ((1, 0), (0, 1)) and data.size == 0:
+        # an empty matrix. This short circuit is necessary for the same reason
+        # as the empty vector. While a (1, 0) matrix is _empty_, this does
+        # confound code that assumes that (1, 0) means there might be metadata
+        # or IDs associated with that singular row
+        return csr_matrix((0, 0), dtype=dtype)
+    elif len(data.shape) == 1:
+        # a vector
         shape = (1, data.shape[0])
     else:
         shape = data.shape
@@ -2365,10 +2475,13 @@ def list_dict_to_sparse(data, dtype=float):
     return matrix
 
 
-def dict_to_sparse(data, dtype=float):
+def dict_to_sparse(data, dtype=float, shape=None):
     """Takes a dict {(row,col):val} and creates a scipy.sparse matrix."""
-    n_rows = max(data.keys(), key=itemgetter(0))[0] + 1
-    n_cols = max(data.keys(), key=itemgetter(1))[1] + 1
+    if shape is None:
+        n_rows = max(data.keys(), key=itemgetter(0))[0] + 1
+        n_cols = max(data.keys(), key=itemgetter(1))[1] + 1
+    else:
+        n_rows, n_cols = shape
 
     rows = []
     cols = []

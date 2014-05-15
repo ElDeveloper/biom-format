@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# -*- coding: utf-8 -*-
 
 # ----------------------------------------------------------------------------
 # Copyright (c) 2011-2013, The BIOM Format Development Team.
@@ -18,7 +19,7 @@ import numpy as np
 __author__ = "Daniel McDonald"
 __copyright__ = "Copyright 2011-2013, The BIOM Format Development Team"
 __credits__ = ["Greg Caporaso", "Daniel McDonald", "Jose Clemente",
-               "Jai Ram Rideout"]
+               "Jai Ram Rideout", "Jorge Cañardo Alastuey"]
 __license__ = "BSD"
 __version__ = "1.3.1-dev"
 __maintainer__ = "Daniel McDonald"
@@ -84,14 +85,11 @@ setup(name='biom-format',
       include_dirs=[np.get_include()],
       scripts=glob('scripts/*'),
       install_requires=["numpy >= 1.3.0",
-                        "pyqi == 0.3.1",
+                        "pyqi == 0.3.2",
                         "scipy >= 0.13.0"],
       extras_require={'test': ["nose >= 0.10.1",
                                "tox >= 1.6.1"],
                       'hdf5': ["h5py >= 2.2.0"]
                       },
-      dependency_links=[
-          'https://github.com/bipy/pyqi/archive/master.zip#egg=pyqi-0.3.1-dev'
-      ],
       classifiers=classifiers
       )

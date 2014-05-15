@@ -12,13 +12,16 @@ import os
 from StringIO import StringIO
 import json
 from biom import __version__
-import h5py
+
 from numpy import array
 import numpy.testing as npt
 from unittest import TestCase, main
-from biom.parse import (parse_biom_table_json, parse_classic_table,
-                        generatedby, MetadataMap)
+from biom.parse import generatedby, MetadataMap
 from biom.table import Table
+from biom.util import HAVE_H5PY
+
+if HAVE_H5PY:
+    import h5py
 
 __author__ = "Justin Kuczynski"
 __copyright__ = "Copyright 2011-2013, The BIOM Format Development Team"
@@ -142,7 +145,7 @@ class ParseTests(TestCase):
         # light test. this code is used thoroughly within the other
         # parse_biom_table methods
         tab1_fh = json.load(StringIO(self.biom_minimal_sparse))
-        tab = parse_biom_table_json(tab1_fh)
+        tab = Table.from_json(tab1_fh)
         npt.assert_equal((tab.sample_ids), ('Sample1', 'Sample2',
                                             'Sample3', 'Sample4', 'Sample5',
                                             'Sample6',))
@@ -152,6 +155,7 @@ class ParseTests(TestCase):
         self.assertEqual(tab.sample_metadata, None)
         self.assertEqual(tab.observation_metadata, None)
 
+    @npt.dec.skipif(HAVE_H5PY is False, msg='H5PY is not installed')
     def test_parse_biom_table_hdf5(self):
         """Make sure we can parse a HDF5 table through the same loader"""
         cwd = os.getcwd()
@@ -165,37 +169,6 @@ class ParseTests(TestCase):
         # this method is tested through parse_biom_table tests
         pass
 
-    def test_parse_classic_table(self):
-        """Parses a classic table
-
-        This method is ported from QIIME (http://www.qiime.org). QIIME is a GPL
-        project, but we obtained permission from the authors of this method to
-        port it to the BIOM Format project (and keep it under BIOM's BSD
-        license).
-        """
-        input = legacy_otu_table1.splitlines()
-        samp_ids = ['Fing', 'Key', 'NA']
-        obs_ids = ['0', '1', '7', '3', '4']
-        metadata = [
-            'Bacteria; Actinobacteria; Actinobacteridae; Propionibacterineae; '
-            'Propionibacterium',
-            'Bacteria; Firmicutes; Alicyclobacillaceae; Bacilli; Lactobacillal'
-            'es; Lactobacillales; Streptococcaceae; Streptococcus',
-            'Bacteria; Actinobacteria; Actinobacteridae; Gordoniaceae; Coryneb'
-            'acteriaceae',
-            'Bacteria; Firmicutes; Alicyclobacillaceae; Bacilli; Staphylococca'
-            'ceae',
-            'Bacteria; Cyanobacteria; Chloroplasts; vectors']
-        md_name = 'Consensus Lineage'
-        data = array([[19111, 44536, 42],
-                      [1216, 3500, 6],
-                      [1803, 1184, 2],
-                      [1722, 4903, 17],
-                      [589, 2074, 34]])
-
-        exp = (samp_ids, obs_ids, data, metadata, md_name)
-        obs = parse_classic_table(input, dtype=int)
-        npt.assert_equal(obs, exp)
 
 legacy_otu_table1 = """# some comment goes here
 #OTU ID	Fing	Key	NA	Consensus Lineage
